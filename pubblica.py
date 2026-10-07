@@ -73,42 +73,62 @@ def aggiorna_post(pid, **campi):
     raise RuntimeError("impossibile aggiornare coda.json")
 
 
+def metti_online(locale, nomi_tmp):
+    """Copia un file nella release pubblica "tmp" con nome casuale e ritorna l'URL firmato."""
+    nome = secrets.token_hex(16) + os.path.splitext(locale)[1]
+    dest = f"/tmp/{nome}"
+    os.rename(locale, dest)
+    gh("release", "upload", "tmp", dest, "-R", PUB_REPO)
+    nomi_tmp.append(nome)
+    os.remove(dest)
+    link = f"https://github.com/{PUB_REPO}/releases/download/tmp/{nome}"
+    return subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{redirect_url}", link],
+                          capture_output=True, text=True).stdout.strip() or link
+
+
+def aspetta(cid, minuti=10):
+    for _ in range(minuti * 6):
+        s = ig("GET", cid, {"fields": "status_code,status"})
+        if s.get("status_code") == "FINISHED":
+            return
+        if s.get("status_code") in ("ERROR", "EXPIRED"):
+            raise RuntimeError(f"Instagram ha rifiutato il contenuto: {s.get('status')}")
+        time.sleep(10)
+    raise RuntimeError(f"Instagram non ha finito di elaborare in {minuti} minuti")
+
+
+def scarica(nome):
+    locale = f"/tmp/scarico-{nome}"
+    gh("release", "download", "video", "-R", CODA_REPO, "-p", nome, "-O", locale, "--clobber")
+    return locale
+
+
 def pubblica(p):
-    pid = p["id"]
-    lavoro = f"/tmp/{pid}.mp4"
-    gh("release", "download", "video", "-R", CODA_REPO, "-p", p["file"], "-O", lavoro, "--clobber")
-
-    nome_tmp = secrets.token_hex(16) + ".mp4"
-    os.rename(lavoro, f"/tmp/{nome_tmp}")
-    gh("release", "upload", "tmp", f"/tmp/{nome_tmp}", "-R", PUB_REPO)
+    nomi_tmp = []
     try:
-        link = f"https://github.com/{PUB_REPO}/releases/download/tmp/{nome_tmp}"
-        firmato = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{redirect_url}", link],
-                                 capture_output=True, text=True).stdout.strip() or link
-
-        params = {"media_type": "REELS", "video_url": firmato, "caption": p.get("caption", ""),
-                  "share_to_feed": "true"}
-        if p.get("copertina_ms") is not None:
-            params["thumb_offset"] = str(p["copertina_ms"])
-        cid = ig("POST", f"{IG_USER}/media", params)["id"]
-
-        for _ in range(60):  # fino a 10 minuti
-            s = ig("GET", cid, {"fields": "status_code,status"})
-            if s.get("status_code") == "FINISHED":
-                break
-            if s.get("status_code") in ("ERROR", "EXPIRED"):
-                raise RuntimeError(f"Instagram ha rifiutato il video: {s.get('status')}")
-            time.sleep(10)
+        if p.get("tipo") == "carosello":
+            figli = []
+            for nome in p["files"]:
+                url = metti_online(scarica(nome), nomi_tmp)
+                cid = ig("POST", f"{IG_USER}/media", {"image_url": url, "is_carousel_item": "true"})["id"]
+                aspetta(cid, 3)
+                figli.append(cid)
+            cid = ig("POST", f"{IG_USER}/media", {"media_type": "CAROUSEL", "children": ",".join(figli),
+                                                  "caption": p.get("caption", "")})["id"]
         else:
-            raise RuntimeError("Instagram non ha finito di elaborare il video in 10 minuti")
-
+            url = metti_online(scarica(p["file"]), nomi_tmp)
+            params = {"media_type": "REELS", "video_url": url, "caption": p.get("caption", ""),
+                      "share_to_feed": "true"}
+            if p.get("copertina_ms") is not None:
+                params["thumb_offset"] = str(p["copertina_ms"])
+            cid = ig("POST", f"{IG_USER}/media", params)["id"]
+        aspetta(cid)
         media = ig("POST", f"{IG_USER}/media_publish", {"creation_id": cid})["id"]
         link_post = ig("GET", media, {"fields": "permalink"}).get("permalink", "")
     finally:
-        subprocess.run(["gh", "release", "delete-asset", "tmp", nome_tmp, "-R", PUB_REPO, "-y"],
-                       capture_output=True)
-        if os.path.exists(f"/tmp/{nome_tmp}"):
-            os.remove(f"/tmp/{nome_tmp}")
+        for nome in nomi_tmp:
+            subprocess.run(["gh", "release", "delete-asset", "tmp", nome, "-R", PUB_REPO, "-y"],
+                           capture_output=True)
     return media, link_post
 
 
@@ -139,10 +159,9 @@ def main():
             continue
         aggiorna_post(pid, stato="pubblicato", media_id=media, link=link,
                       pubblicato_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
-        try:  # il video non serve più nella coda
-            gh("release", "delete-asset", "video", p["file"], "-R", CODA_REPO, "-y")
-        except RuntimeError:
-            pass
+        for nome in p.get("files") or [p["file"]]:  # i file non servono più nella coda
+            subprocess.run(["gh", "release", "delete-asset", "video", nome, "-R", CODA_REPO, "-y"],
+                           capture_output=True)
         print(f"{pid}: pubblicato")
     sys.exit(1 if errori else 0)  # job rosso = mail di GitHub
 
