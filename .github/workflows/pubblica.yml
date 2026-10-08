@@ -19,4 +19,6 @@ jobs:
         env:
           IG_TOKEN: ${{ secrets.IG_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           GH_TOKEN: ${{ secrets.GH_PAT }}

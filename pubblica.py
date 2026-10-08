@@ -17,6 +17,8 @@ IG_USER = os.environ["IG_USER_ID"]
 OWNER = os.environ["GITHUB_REPOSITORY_OWNER"]
 CODA_REPO = f"{OWNER}/ig-coda"
 PUB_REPO = os.environ["GITHUB_REPOSITORY"]
+FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
+FB_PAGE = os.environ.get("FB_PAGE_ID", "")
 MAX_RITARDO_ORE = 6  # oltre questo ritardo non pubblichiamo: segnaliamo errore
 
 
@@ -41,6 +43,39 @@ def ig(method, path, params=None):
     except urllib.error.HTTPError as e:
         msg = e.read().decode()[:400].replace(TOKEN, "***")
         raise RuntimeError(f"Instagram HTTP {e.code}: {msg}")
+
+
+def fb(method, path, params=None, url=None, headers=None, data=None):
+    params = dict(params or {}, access_token=FB_TOKEN)
+    url = url or f"https://graph.facebook.com/{V}/{path}"
+    if method == "GET":
+        url += "?" + urllib.parse.urlencode(params)
+    elif data is None:
+        data = urllib.parse.urlencode(params).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers=headers or {}),
+                                    timeout=300) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Facebook HTTP {e.code}: {e.read().decode()[:400].replace(FB_TOKEN, '***')}")
+
+
+def pubblica_fb(p, urls):
+    """Pubblica sulla Pagina Facebook lo stesso contenuto (URL temporanei già online)."""
+    caption = p.get("caption", "")
+    if p.get("tipo") == "carosello":
+        foto = [fb("POST", f"{FB_PAGE}/photos", {"url": u, "published": "false"})["id"] for u in urls]
+        params = {"message": caption}
+        for i, f in enumerate(foto):
+            params[f"attached_media[{i}]"] = json.dumps({"media_fbid": f})
+        post = fb("POST", f"{FB_PAGE}/feed", params)["id"]
+        return post, f"https://www.facebook.com/{post}"
+    vid = fb("POST", f"{FB_PAGE}/video_reels", {"upload_phase": "start"})["video_id"]
+    fb("POST", None, url=f"https://rupload.facebook.com/video-upload/{V}/{vid}", data=b"",
+       headers={"Authorization": f"OAuth {FB_TOKEN}", "file_url": urls[0]})
+    fb("POST", f"{FB_PAGE}/video_reels", {"upload_phase": "finish", "video_id": vid,
+                                          "video_state": "PUBLISHED", "description": caption})
+    return vid, f"https://www.facebook.com/reel/{vid}"
 
 
 def leggi_coda():
@@ -105,11 +140,14 @@ def scarica(nome):
 
 def pubblica(p):
     nomi_tmp = []
+    urls = []
+    fb_esito = {}
     try:
         if p.get("tipo") == "carosello":
             figli = []
             for nome in p["files"]:
                 url = metti_online(scarica(nome), nomi_tmp)
+                urls.append(url)
                 cid = ig("POST", f"{IG_USER}/media", {"image_url": url, "is_carousel_item": "true"})["id"]
                 aspetta(cid, 3)
                 figli.append(cid)
@@ -117,6 +155,7 @@ def pubblica(p):
                                                   "caption": p.get("caption", "")})["id"]
         else:
             url = metti_online(scarica(p["file"]), nomi_tmp)
+            urls.append(url)
             params = {"media_type": "REELS", "video_url": url, "caption": p.get("caption", ""),
                       "share_to_feed": "true"}
             if p.get("copertina_ms") is not None:
@@ -125,11 +164,17 @@ def pubblica(p):
         aspetta(cid)
         media = ig("POST", f"{IG_USER}/media_publish", {"creation_id": cid})["id"]
         link_post = ig("GET", media, {"fields": "permalink"}).get("permalink", "")
+        if FB_TOKEN and FB_PAGE:
+            try:  # Facebook non deve mai bloccare Instagram
+                fb_id, fb_link = pubblica_fb(p, urls)
+                fb_esito = {"fb_id": fb_id, "fb_link": fb_link}
+            except Exception as e:
+                fb_esito = {"fb_errore": str(e)[:400]}
     finally:
         for nome in nomi_tmp:
             subprocess.run(["gh", "release", "delete-asset", "tmp", nome, "-R", PUB_REPO, "-y"],
                            capture_output=True)
-    return media, link_post
+    return media, link_post, fb_esito
 
 
 def main():
@@ -151,18 +196,20 @@ def main():
             continue
         aggiorna_post(pid, stato="in pubblicazione")
         try:
-            media, link = pubblica(p)
+            media, link, fb_esito = pubblica(p)
         except Exception as e:
             aggiorna_post(pid, stato="errore", errore=str(e)[:500])
             print(f"{pid}: ERRORE (dettagli in coda.json)")
             errori += 1
             continue
-        aggiorna_post(pid, stato="pubblicato", media_id=media, link=link,
+        aggiorna_post(pid, stato="pubblicato", media_id=media, link=link, **fb_esito,
                       pubblicato_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         for nome in p.get("files") or [p["file"]]:  # i file non servono più nella coda
             subprocess.run(["gh", "release", "delete-asset", "video", nome, "-R", CODA_REPO, "-y"],
                            capture_output=True)
-        print(f"{pid}: pubblicato")
+        print(f"{pid}: pubblicato" + (" (Facebook: ERRORE)" if "fb_errore" in fb_esito else " (anche su Facebook)" if fb_esito else ""))
+        if "fb_errore" in fb_esito:
+            errori += 1
     sys.exit(1 if errori else 0)  # job rosso = mail di GitHub
 
 
