@@ -8,7 +8,7 @@ e poi cancellato.
 
 Questo repo è pubblico: nei log non stampiamo mai caption né token.
 """
-import base64, json, os, secrets, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import base64, json, os, secrets, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 
 V = "v23.0"
@@ -158,6 +158,10 @@ def pubblica(p):
             urls.append(url)
             params = {"media_type": "REELS", "video_url": url, "caption": p.get("caption", ""),
                       "share_to_feed": "true"}
+            if p.get("copertina"):  # immagine JPEG nella release "video" della coda
+                cop = scarica(p["copertina"])
+                shutil.copyfile(cop, "/tmp/copertina_fb.jpg")
+                params["cover_url"] = metti_online(cop, nomi_tmp)
             if p.get("copertina_ms") is not None:
                 params["thumb_offset"] = str(p["copertina_ms"])
             cid = ig("POST", f"{IG_USER}/media", params)["id"]
@@ -168,6 +172,16 @@ def pubblica(p):
             try:  # Facebook non deve mai bloccare Instagram
                 fb_id, fb_link = pubblica_fb(p, urls)
                 fb_esito = {"fb_id": fb_id, "fb_link": fb_link}
+                if p.get("copertina") and os.path.exists("/tmp/copertina_fb.jpg"):
+                    for _ in range(12):  # Facebook accetta la copertina quando ha finito di elaborare il video
+                        r = subprocess.run(["curl", "-s", "-X", "POST", f"https://graph.facebook.com/{V}/{fb_id}/thumbnails",
+                                            "-F", "source=@/tmp/copertina_fb.jpg", "-F", "is_preferred=true",
+                                            "-F", f"access_token={FB_TOKEN}"], capture_output=True, text=True).stdout
+                        if '"success":true' in r:
+                            fb_esito["fb_copertina"] = "ok"; break
+                        time.sleep(20)
+                    else:
+                        fb_esito["fb_copertina"] = "non riuscita"
             except Exception as e:
                 fb_esito = {"fb_errore": str(e)[:400]}
     finally:
